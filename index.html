@@ -1,0 +1,542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Batch Otsu Box (200×200) + Freehand Region & Brightness Ratio with Resume</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 20px;
+    }
+    #container {
+      position: relative;
+      width: 350px;
+      height: 350px;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+      margin-bottom: 10px;
+    }
+    canvas {
+      display: block;
+    }
+    #originalCanvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 1;
+      background: #000;
+    }
+    #overlayCanvas {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 2;
+      cursor: crosshair;
+    }
+    #controls {
+      margin-top: 10px;
+    }
+    #controls button {
+      margin-right: 8px;
+    }
+    #status {
+      margin-top: 10px;
+      font-size: 0.9em;
+      color: #333;
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <h2>Batch Otsu Box (200×200) + Freehand Region & Brightness Ratio with Resume</h2>
+  <p>
+    Select a folder of images. For each image:
+    <ol>
+      <li>Compute Otsu mask on the full 350×350 canvas.</li>
+      <li>Slide a 200×200 window over the mask (step = 1) to find the position with the maximum mask-foreground pixels; draw that as the initial blue box.</li>
+      <li>You may drag the 200×200 box anywhere within the canvas.</li>
+      <li>Click “Draw Region” to freehand-draw a closed shape; click “Finish Draw” when done.</li>
+      <li>When both rectangle and region exist, click “Apply Mask”: compute 
+        <ul>
+          <li>average brightness inside the overlap area (intersection of the 200×200 box and the region),</li>
+          <li>average brightness of the outside area (pixels inside the 200×200 box but outside the region),</li>
+          <li>ratio = avgBrightnessInside / avgBrightnessOutside.</li>
+        </ul>
+      </li>
+      <li>Append `filename,ratio` to CSV, then automatically proceed to the next image.</li>
+      <li>After all images, download `ratio.csv`.</li>
+      <li>If you close the page mid-way, on reopening and reselecting the same folder, it will resume from where you left off.</li>
+    </ol>
+  </p>
+  <input type="file" id="fileInput" webkitdirectory directory multiple accept="image/*"><br>
+  <div id="container">
+    <canvas id="originalCanvas" width="350" height="350"></canvas>
+    <canvas id="overlayCanvas" width="350" height="350"></canvas>
+  </div>
+  <div id="controls">
+    <button id="drawRegionBtn" disabled>Draw Region</button>
+    <button id="applyMaskBtn" disabled>Apply Mask</button>
+  </div>
+  <div id="status"></div>
+  <script>
+    const CANVAS_SIZE = 350;
+    const RECT_W = 240;
+    const RECT_H = 240;
+    const fileInput = document.getElementById('fileInput');
+    const originalCanvas = document.getElementById('originalCanvas');
+    const overlayCanvas = document.getElementById('overlayCanvas');
+    const drawRegionBtn = document.getElementById('drawRegionBtn');
+    const applyMaskBtn = document.getElementById('applyMaskBtn');
+    const statusDiv = document.getElementById('status');
+    const origCtx = originalCanvas.getContext('2d');
+    const overCtx = overlayCanvas.getContext('2d');
+    let files = [];
+    let fileIndex = 0;
+    let csvRows = [];
+    let currentMask = null;
+    let rect = null;
+    let regionPath = null;
+    let drawMode = false;
+    let isDrawing = false;
+    let drawPoints = [];
+    let isDraggingRect = false;
+    let dragOffsetX = 0, dragOffsetY = 0;
+    let isManualRectDrawing = false;
+    let manualStartX = 0, manualStartY = 0;
+
+    function computeOtsuMaskFromImageData(imageData) {
+      const { data, width, height } = imageData;
+      const totalPixels = width * height;
+      const hist = new Uint32Array(256);
+      const gray = new Uint8ClampedArray(totalPixels);
+      for (let i = 0; i < totalPixels; i++) {
+        const r = data[i*4], g = data[i*4+1], b = data[i*4+2];
+        const lum = Math.round(0.299*r + 0.587*g + 0.114*b);
+        gray[i] = lum;
+        hist[lum]++;
+      }
+      let sumAll = 0;
+      for (let t = 0; t < 256; t++) sumAll += t * hist[t];
+      let sumB = 0, wB = 0;
+      let maxVar = -1, threshold = 0;
+      for (let t = 0; t < 256; t++) {
+        wB += hist[t];
+        if (wB === 0) continue;
+        const wF = totalPixels - wB;
+        if (wF === 0) break;
+        sumB += t * hist[t];
+        const mB = sumB / wB;
+        const mF = (sumAll - sumB) / wF;
+        const varBetween = wB * wF * (mB - mF) * (mB - mF);
+        if (varBetween > maxVar) {
+          maxVar = varBetween;
+          threshold = t;
+        }
+      }
+      const mask = new Uint8Array(totalPixels);
+      for (let i = 0; i < totalPixels; i++) {
+        mask[i] = (gray[i] > threshold) ? 1 : 0;
+      }
+      return mask;
+    }
+
+    function findBestWindowPosition(mask) {
+      const width = CANVAS_SIZE, height = CANVAS_SIZE;
+      const W = width, H = height;
+      const integral = Array(H+1);
+      integral[0] = new Uint32Array(W+1);
+      for (let y = 1; y <= H; y++) {
+        const rowSum = new Uint32Array(W+1);
+        let running = 0;
+        for (let x = 1; x <= W; x++) {
+          running += mask[(y-1)*W + (x-1)];
+          rowSum[x] = running;
+        }
+        integral[y] = rowSum.map((val, idx) => val + integral[y-1][idx]);
+      }
+      let bestCount = -1, bestX = 0, bestY = 0;
+      for (let y0 = 0; y0 + RECT_H <= H; y0++) {
+        for (let x0 = 0; x0 + RECT_W <= W; x0++) {
+          const y1 = y0 + RECT_H, x1 = x0 + RECT_W;
+          const count = integral[y1][x1] - integral[y0][x1] - integral[y1][x0] + integral[y0][x0];
+          if (count > bestCount) {
+            bestCount = count;
+            bestX = x0;
+            bestY = y0;
+          }
+        }
+      }
+      return { x: bestX, y: bestY, count: bestCount };
+    }
+
+    function drawRectangle(r) {
+      if (!r) return;
+      overCtx.strokeStyle = 'blue';
+      overCtx.lineWidth = 2;
+      overCtx.setLineDash([4,2]);
+      overCtx.strokeRect(r.x, r.y, r.w, r.h);
+    }
+
+    function drawRegionPath(path) {
+      if (!path || path.length < 2) return;
+      overCtx.beginPath();
+      overCtx.moveTo(path[0].x, path[0].y);
+      for (let i = 1; i < path.length; i++) {
+        overCtx.lineTo(path[i].x, path[i].y);
+      }
+      overCtx.closePath();
+      overCtx.strokeStyle = 'red';
+      overCtx.lineWidth = 2;
+      overCtx.setLineDash([]);
+      overCtx.stroke();
+      overCtx.fillStyle = 'rgba(255,0,0,0.2)';
+      overCtx.fill();
+    }
+
+    function redrawOverlay() {
+      overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      if (rect) drawRectangle(rect);
+      if (regionPath) drawRegionPath(regionPath);
+    }
+
+    function pointInPolygon(x, y, poly) {
+      let inside = false;
+      for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+        const xi = poly[i].x, yi = poly[i].y;
+        const xj = poly[j].x, yj = poly[j].y;
+        const intersect = ((yi > y) !== (yj > y))
+                          && (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+        if (intersect) inside = !inside;
+      }
+      return inside;
+    }
+
+    function computeBrightnessRatio(rect, regionPath) {
+      const width = CANVAS_SIZE, height = CANVAS_SIZE;
+      const imgData = origCtx.getImageData(0, 0, width, height);
+      const data = imgData.data;
+      let sumInside = 0, countInside = 0;
+      let sumOutside = 0, countOutside = 0;
+      for (let dy = 0; dy < rect.h; dy++) {
+        const y = rect.y + dy;
+        if (y < 0 || y >= height) continue;
+        for (let dx = 0; dx < rect.w; dx++) {
+          const x = rect.x + dx;
+          if (x < 0 || x >= width) continue;
+          const idx = (y * width + x) * 4;
+          const r = data[idx], g = data[idx+1], b = data[idx+2];
+          const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+          if (pointInPolygon(x + 0.5, y + 0.5, regionPath)) {
+            sumInside += lum;
+            countInside++;
+          } else {
+            sumOutside += lum;
+            countOutside++;
+          }
+        }
+      }
+      const avgInside = countInside > 0 ? sumInside / countInside : null;
+      const avgOutside = countOutside > 0 ? sumOutside / countOutside : null;
+      let ratio = null;
+      if (avgInside !== null && avgOutside !== null && avgOutside !== 0) {
+        ratio = avgInside / avgOutside;
+      }
+      return { avgInside, avgOutside, ratio, countInside, countOutside };
+    }
+
+    function loadNextImage() {
+      if (fileIndex >= files.length) {
+        finishAndDownloadCSV();
+        return;
+      }
+      const file = files[fileIndex];
+      const displayName = file.webkitRelativePath || file.name;
+      statusDiv.textContent = `Processing ${fileIndex+1} / ${files.length}: ${displayName}`;
+      currentMask = null;
+      rect = null;
+      regionPath = null;
+      drawMode = false;
+      isDrawing = false;
+      isDraggingRect = false;
+      isManualRectDrawing = false;
+      drawPoints = [];
+      drawRegionBtn.disabled = true;
+      applyMaskBtn.disabled = true;
+      drawRegionBtn.textContent = 'Draw Region';
+      origCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+      const reader = new FileReader();
+      reader.onload = e => {
+        const img = new Image();
+        img.onload = () => {
+          origCtx.fillStyle = '#000';
+          origCtx.fillRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          const iw = img.width, ih = img.height;
+          const scale = Math.min(CANVAS_SIZE / iw, CANVAS_SIZE / ih);
+          const dw = iw * scale, dh = ih * scale;
+          const dx = Math.floor((CANVAS_SIZE - dw) / 2);
+          const dy = Math.floor((CANVAS_SIZE - dh) / 2);
+          origCtx.drawImage(img, 0, 0, iw, ih, dx, dy, dw, dh);
+          const imageData = origCtx.getImageData(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          const mask = computeOtsuMaskFromImageData(imageData);
+          currentMask = mask;
+          const { x: bestX, y: bestY, count } = findBestWindowPosition(mask);
+          if (count > 0) {
+            rect = { x: bestX, y: bestY, w: RECT_W, h: RECT_H };
+            statusDiv.textContent += "\nOtsu & sliding-window placed 200×200 blue box. You may drag it or draw region.";
+          } else {
+            rect = null;
+            statusDiv.textContent += "\nNo mask foreground found by Otsu; please draw a 200×200 box manually by clicking & dragging.";
+          }
+          redrawOverlay();
+          drawRegionBtn.disabled = false;
+          applyMaskBtn.disabled = true;
+        };
+        img.onerror = () => {
+          statusDiv.textContent = `Failed to load ${displayName}, skipping.`;
+          fileIndex++;
+          localStorage.setItem('batchIndex', fileIndex.toString());
+          localStorage.setItem('batchCSV', JSON.stringify(csvRows));
+          setTimeout(loadNextImage, 200);
+        };
+        img.src = e.target.result;
+      };
+      reader.onerror = () => {
+        statusDiv.textContent = `Error reading ${displayName}, skipping.`;
+        fileIndex++;
+        localStorage.setItem('batchIndex', fileIndex.toString());
+        localStorage.setItem('batchCSV', JSON.stringify(csvRows));
+        setTimeout(loadNextImage, 200);
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function finishAndDownloadCSV() {
+      statusDiv.textContent = 'All images processed. Downloading ratio.csv...';
+      localStorage.removeItem('batchFileList');
+      localStorage.removeItem('batchIndex');
+      localStorage.removeItem('batchCSV');
+      if (csvRows.length === 0) {
+        csvRows.push('filename,ratio');
+      }
+      const csvContent = csvRows.join('\n');
+      const blob = new Blob([csvContent], { type: 'text/csv' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'ratio.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      statusDiv.textContent = 'Done. ratio.csv downloaded.';
+    }
+
+    overlayCanvas.addEventListener('mousedown', (e) => {
+      const rectBounds = overlayCanvas.getBoundingClientRect();
+      const x = Math.floor(e.clientX - rectBounds.left);
+      const y = Math.floor(e.clientY - rectBounds.top);
+      if (drawMode) {
+        isDrawing = true;
+        drawPoints = [{ x, y }];
+        overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        redrawOverlay();
+        overCtx.beginPath();
+        overCtx.moveTo(x, y);
+      } else {
+        if (rect && x >= rect.x && x <= rect.x + rect.w && y >= rect.y && y <= rect.y + rect.h) {
+          isDraggingRect = true;
+          dragOffsetX = x - rect.x;
+          dragOffsetY = y - rect.y;
+        } else if (!rect) {
+          isManualRectDrawing = true;
+          manualStartX = x;
+          manualStartY = y;
+        }
+      }
+    });
+
+    overlayCanvas.addEventListener('mousemove', (e) => {
+      const rectBounds = overlayCanvas.getBoundingClientRect();
+      const x = Math.floor(e.clientX - rectBounds.left);
+      const y = Math.floor(e.clientY - rectBounds.top);
+      if (drawMode && isDrawing) {
+        drawPoints.push({ x, y });
+        overCtx.lineTo(x, y);
+        overCtx.strokeStyle = 'red';
+        overCtx.lineWidth = 2;
+        overCtx.setLineDash([]);
+        overCtx.stroke();
+      } else if (!drawMode && isDraggingRect) {
+        let newX = x - dragOffsetX;
+        let newY = y - dragOffsetY;
+        newX = Math.max(0, Math.min(newX, CANVAS_SIZE - RECT_W));
+        newY = Math.max(0, Math.min(newY, CANVAS_SIZE - RECT_H));
+        rect.x = newX;
+        rect.y = newY;
+        overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        redrawOverlay();
+      } else if (!drawMode && isManualRectDrawing) {
+        overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        redrawOverlay();
+        let px = manualStartX, py = manualStartY;
+        px = Math.max(0, Math.min(px, CANVAS_SIZE - RECT_W));
+        py = Math.max(0, Math.min(py, CANVAS_SIZE - RECT_H));
+        overCtx.strokeStyle = 'blue';
+        overCtx.lineWidth = 2;
+        overCtx.setLineDash([4,2]);
+        overCtx.strokeRect(px, py, RECT_W, RECT_H);
+      }
+    });
+
+    overlayCanvas.addEventListener('mouseup', (e) => {
+      const rectBounds = overlayCanvas.getBoundingClientRect();
+      const x = Math.floor(e.clientX - rectBounds.left);
+      const y = Math.floor(e.clientY - rectBounds.top);
+      if (drawMode && isDrawing) {
+        isDrawing = false;
+      }
+      if (!drawMode && isDraggingRect) {
+        isDraggingRect = false;
+      }
+      if (!drawMode && isManualRectDrawing) {
+        isManualRectDrawing = false;
+        let px = manualStartX, py = manualStartY;
+        px = Math.max(0, Math.min(px, CANVAS_SIZE - RECT_W));
+        py = Math.max(0, Math.min(py, CANVAS_SIZE - RECT_H));
+        rect = { x: px, y: py, w: RECT_W, h: RECT_H };
+        statusDiv.textContent += `\nManual 200×200 box at x=${px},y=${py}.`;
+        redrawOverlay();
+        if (regionPath) applyMaskBtn.disabled = false;
+      }
+    });
+
+    overlayCanvas.addEventListener('mouseleave', (e) => {
+      if (drawMode && isDrawing) {
+        isDrawing = false;
+      }
+      if (!drawMode && isDraggingRect) {
+        isDraggingRect = false;
+      }
+      if (!drawMode && isManualRectDrawing) {
+        isManualRectDrawing = false;
+      }
+    });
+
+    overlayCanvas.addEventListener('contextmenu', e => e.preventDefault());
+
+    drawRegionBtn.addEventListener('click', () => {
+      if (!drawMode) {
+        drawMode = true;
+        drawRegionBtn.textContent = 'Finish Draw';
+        statusDiv.textContent += '\nDraw freehand region: click-drag to draw. When done, click "Finish Draw".';
+        regionPath = null;
+        overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+        redrawOverlay();
+      } else {
+        drawMode = false;
+        drawRegionBtn.textContent = 'Draw Region';
+        if (drawPoints.length >= 3) {
+          regionPath = drawPoints.slice();
+          overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          redrawOverlay();
+          statusDiv.textContent += '\nRegion drawn. Click "Apply Mask" to compute brightness ratio.';
+          if (rect) applyMaskBtn.disabled = false;
+        } else {
+          regionPath = null;
+          overCtx.clearRect(0, 0, CANVAS_SIZE, CANVAS_SIZE);
+          redrawOverlay();
+          statusDiv.textContent += '\nRegion drawing too small; try again.';
+          applyMaskBtn.disabled = true;
+        }
+        drawPoints = [];
+      }
+    });
+
+    applyMaskBtn.addEventListener('click', () => {
+      if (!rect) {
+        alert('No 200×200 rectangle defined. Please drag the blue box or draw it manually.');
+        return;
+      }
+      if (!regionPath) {
+        alert('No freehand region drawn. Click "Draw Region" first.');
+        return;
+      }
+      const { avgInside, avgOutside, ratio, countInside, countOutside } = computeBrightnessRatio(rect, regionPath);
+      const displayName = files[fileIndex].webkitRelativePath || files[fileIndex].name;
+      let msg = `File: ${displayName}\n`;
+      msg += `Blue box: x=${rect.x},y=${rect.y},w=${rect.w},h=${rect.h}\n`;
+      msg += `Region points: ${regionPath.length}\n`;
+      msg += `Pixels in overlap: ${countInside}\n`;
+      msg += `Pixels in outside area: ${countOutside}\n`;
+      msg += `Avg brightness inside overlap: ${avgInside !== null ? avgInside.toFixed(1) : 'N/A'}\n`;
+      msg += `Avg brightness outside: ${avgOutside !== null ? avgOutside.toFixed(1) : 'N/A'}\n`;
+      msg += `Ratio (avgInside / avgOutside): ${ (ratio !== null) ? ratio.toFixed(4) : 'N/A (outside avg zero or no pixels)' }`;
+      alert(msg);
+      const rawName = displayName;
+      const safeName = rawName.replace(/[\r\n]+/g, '_').replace(/,/g, '_');
+      const ratioStr = (ratio !== null) ? ratio.toFixed(4) : '';
+      if (fileIndex === 0 && csvRows.length === 0) {
+        csvRows.push('filename,ratio');
+      }
+      if (fileIndex === 0 && csvRows.length === 1 && csvRows[0] !== 'filename,ratio') {
+        csvRows[0] = 'filename,ratio';
+      }
+      csvRows.push(`${safeName},${ratioStr}`);
+      localStorage.setItem('batchCSV', JSON.stringify(csvRows));
+      fileIndex++;
+      localStorage.setItem('batchIndex', fileIndex.toString());
+      loadNextImage();
+    });
+
+    fileInput.addEventListener('change', () => {
+      const selectedFiles = Array.from(fileInput.files);
+      files = selectedFiles.filter(f => f.type.startsWith('image/'));
+      if (files.length === 0) {
+        alert('No images found in selected folder.');
+        return;
+      }
+      const relativePaths = files.map(f => f.webkitRelativePath || f.name).sort();
+      const listKey = JSON.stringify(relativePaths);
+      const savedList = localStorage.getItem('batchFileList');
+      const savedIndexStr = localStorage.getItem('batchIndex');
+      let resumeIndex = 0;
+      if (savedList === listKey && savedIndexStr !== null) {
+        const savedIndex = parseInt(savedIndexStr, 10);
+        if (!isNaN(savedIndex) && savedIndex < relativePaths.length) {
+          resumeIndex = savedIndex;
+          statusDiv.textContent = `Resuming from image ${resumeIndex+1} of ${relativePaths.length}.`;
+        } else {
+          resumeIndex = 0;
+          statusDiv.textContent = `Folder matched but saved progress out of range; starting from the first image.`;
+        }
+      } else {
+        localStorage.setItem('batchFileList', listKey);
+        localStorage.setItem('batchIndex', '0');
+        statusDiv.textContent = `New folder selected with ${relativePaths.length} images; starting from the first image.`;
+      }
+      const fileMap = {};
+      for (const f of files) {
+        const key = f.webkitRelativePath || f.name;
+        fileMap[key] = f;
+      }
+      files = relativePaths.map(p => fileMap[p]).filter(f => f !== undefined);
+      fileIndex = resumeIndex;
+      csvRows = ['filename,ratio'];
+      const savedCSV = localStorage.getItem('batchCSV');
+      if (savedList === listKey && savedCSV) {
+        try {
+          const arr = JSON.parse(savedCSV);
+          if (Array.isArray(arr)) {
+            csvRows = arr;
+          }
+        } catch(err) {
+          csvRows = ['filename,ratio'];
+        }
+      } else {
+        localStorage.setItem('batchCSV', JSON.stringify(csvRows));
+      }
+      drawRegionBtn.disabled = false;
+      loadNextImage();
+    });
+  </script>
+</body>
+</html>
